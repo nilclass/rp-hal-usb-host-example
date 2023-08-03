@@ -22,11 +22,14 @@ mod app {
 
     use super::descriptor_info::{print_device_descriptor, print_config_descriptor};
 
+    use embedded_hal::digital::v2::OutputPin;
+
     use rp_pico::hal::{
         self,
         clocks,
         watchdog::Watchdog,
         usb::host::UsbHostBus,
+        Clock,
     };
     use rp_pico::XOSC_CRYSTAL_FREQ;
 
@@ -39,6 +42,7 @@ mod app {
 
     pub struct BootKeyboardDriver {
         state: KeyboardState,
+        delay: cortex_m::delay::Delay,
     }
 
     enum KeyboardState {
@@ -54,19 +58,22 @@ mod app {
         Detected,
         // Device configuration selected, setting protocol
         Configured0,
+        // Protocol set, setting idle
+        Configured1,
         // Blink blink
         Blink,
         // Blink done.
-        Ready,
+        Ready(bool),
         Wait,
         // detected other device (not a keyboard)
         OtherDevice,
     }
 
     impl BootKeyboardDriver {
-        fn new() -> Self {
+        fn new(delay: cortex_m::delay::Delay) -> Self {
             Self {
                 state: KeyboardState::Detached,
+                delay,
             }
         }
     }
@@ -75,7 +82,7 @@ mod app {
         fn attached(&mut self, device_address: DeviceAddress, host: &mut UsbHost<B>) {
             info!("[BootKeyboardDriver] New device attached, with address {}", device_address);
             self.state = KeyboardState::Attached;
-            host.get_descriptor(Some(device_address), Recipient::Device, DescriptorType::Device, 18);
+            host.get_descriptor(Some(device_address), Recipient::Device, DescriptorType::Device, 18).unwrap();
         }
 
         fn detached(&mut self, device_address: DeviceAddress) {
@@ -107,6 +114,20 @@ mod app {
                     info!("[BootKeyboardDriver] Keyboard detected, setting configuration");
                     host.set_configuration(device_address, 1);
                 },
+                KeyboardState::Ready(_) => {
+                    info!("Got report: {}", buf);
+                    host.bus().enable_sof();
+                    self.delay.delay_ms(250);
+                    host.control_in(Some(device_address), SetupPacket::new(
+                        UsbDirection::In,
+                        RequestType::Class,
+                        Recipient::Interface,
+                        0x01, // GetReport
+                        1 << 8, // input report
+                        0,
+                        8,
+                    ), 8);
+                }
                 _ => {},
             }
         }
@@ -128,8 +149,20 @@ mod app {
                     ), &[]);
                 }
                 KeyboardState::Configured0 => {
+                    self.state = KeyboardState::Configured1;
+                    host.control_out(Some(device_address), SetupPacket::new(
+                        UsbDirection::Out,
+                        RequestType::Class,
+                        Recipient::Interface,
+                        0x0a, // SetIdle
+                        0,
+                        0,
+                        0,
+                    ), &[]);
+                },
+                KeyboardState::Configured1 => {
                     self.state = KeyboardState::Blink;
-                    info!("[BootKeyboardDriver] Configured. Should be able to receive stuff now. Blinking once to confirm");
+                    info!("[BootKeyboardDriver] Configured1. Should be able to receive stuff now. Blinking once to confirm");
                     host.control_out(Some(device_address), SetupPacket::new(
                         UsbDirection::Out,
                         RequestType::Class,
@@ -150,30 +183,52 @@ mod app {
                         0,
                         1,
                     ), &[0b001, /* only NUM lock on */]);
-                    self.state = KeyboardState::Ready;
+                    self.state = KeyboardState::Ready(true);
                 }
-                KeyboardState::Ready => {
-                    info!("[BootKeyboardDriver] READY!!!");
-                    // let result = host.bus().create_interrupt_pipe(device_address, 1, 8); // let's assume endpoint 1 is correct
-                    // info!("RESULT {}", result);
-                    host.bus().enable_sof();
-                    cortex_m::asm::delay(100000);
-                    host.interrupt_in(device_address, 1, 8);
+                KeyboardState::Ready(pid) => {
+                    info!("[BootKeyboardDriver] Ready. Waiting for keypresses.");
+                    let result = host.bus().create_interrupt_pipe(device_address, 0x1, 8, 20); // let's assume endpoint 1 is correct
+                    info!("RESULT {}", result);
+                    host.bus().dump_dpram();
+                    // host.bus().enable_sof();
+                    // cortex_m::asm::delay(100000);
+                    //defmt::debug!("EXPECTING PID{}", if pid { 1 } else { 0 });
+                    // host.interrupt_in(device_address, 0x1, 8, pid);
+                    self.state = KeyboardState::Ready(!pid);
+                    // host.control_in(Some(device_address), SetupPacket::new(
+                    //     UsbDirection::In,
+                    //     RequestType::Class,
+                    //     Recipient::Interface,
+                    //     0x01, // GetReport
+                    //     1 << 8, // input report
+                    //     0,
+                    //     8,
+                    // ), 8);
                 }
                 _ => {}
             }
         }
 
+        fn pipe_event(&mut self, device_address: DeviceAddress, buf: &[u8]) {
+            info!("Input Report: {}", buf);
+        }
+
         fn interrupt_in_complete(&mut self, device_address: DeviceAddress, length: usize, host: &mut UsbHost<B>) {
-            let buf = unsafe { host.bus().control_buffer(length) };
-            match self.state {
-                KeyboardState::Ready => {
-                    info!("INT IN: {}", buf);
-                    host.bus().enable_sof();
-                    host.interrupt_in(device_address, 1, 8);
-                },
-                _ => {},
-            }
+            let KeyboardState::Ready(pid) = self.state else {
+                panic!()
+            };
+
+            let next_pid = if host.bus().received_len() > 0 {
+                let buf = unsafe { host.bus().control_buffer(length) };
+                info!("Input Report: {}", buf);
+                !pid
+            } else {
+                pid
+            };
+            host.bus().enable_sof();
+            self.delay.delay_ms(100);
+            host.interrupt_in(device_address, 0x1, 8, next_pid);
+            self.state = KeyboardState::Ready(next_pid);
         }
 
         fn interrupt_out_complete(&mut self, dev_addr: DeviceAddress, host: &mut UsbHost<B>) {
@@ -186,6 +241,11 @@ mod app {
     struct Shared {
         usb_host: UsbHost<UsbHostBus>,
         driver: BootKeyboardDriver,
+        pin: hal::gpio::Pin<
+            hal::gpio::bank0::Gpio2,
+            hal::gpio::FunctionSioOutput,
+            hal::gpio::PullDown,
+            >,
     }
 
     // Local resources go here
@@ -211,7 +271,20 @@ mod app {
             &mut watchdog,
         )
         .ok()
-        .unwrap();
+            .unwrap();
+
+        let sio = hal::Sio::new(ctx.device.SIO);
+
+        let pins = hal::gpio::Pins::new(
+            ctx.device.IO_BANK0,
+            ctx.device.PADS_BANK0,
+            sio.gpio_bank0,
+            &mut ctx.device.RESETS,
+        );
+
+        let pin = pins.gpio2.into_push_pull_output();
+
+        let delay = cortex_m::delay::Delay::new(ctx.core.SYST, clocks.system_clock.freq().to_Hz());
 
         // Setup the monotonic timer
         let mono = Rp2040Monotonic::new(ctx.device.TIMER);
@@ -231,7 +304,8 @@ mod app {
             Shared {
                 // Initialization of shared resources go here
                 usb_host,
-                driver: BootKeyboardDriver::new(),
+                driver: BootKeyboardDriver::new(delay),
+                pin,
             },
             Local {
                 // Initialization of local resources go here
@@ -254,6 +328,7 @@ mod app {
         match usb_host.poll(from_delay_task, driver) {
             PollResult::NoDevice => {
                 // No device is attached (yet)
+                return;
             },
             PollResult::Busy => {
                 // Bus is currently busy communicating with the device
@@ -269,17 +344,21 @@ mod app {
         }
     }
 
-    #[task(binds = USBCTRL_IRQ, shared = [usb_host, driver])]
+    #[task(binds = USBCTRL_IRQ, shared = [usb_host, driver, pin])]
     fn usbctrl_irq(mut ctx: usbctrl_irq::Context) {
-        (&mut ctx.shared.usb_host, &mut ctx.shared.driver).lock(|usb_host, driver| {
-            poll_usb_host(usb_host, driver, false)
+        (&mut ctx.shared.usb_host, &mut ctx.shared.driver, &mut ctx.shared.pin).lock(|usb_host, driver, pin| {
+            pin.set_high();
+            poll_usb_host(usb_host, driver, false);
+            pin.set_low();
         });
     }
 
-    #[task(shared = [usb_host, driver])]
+    #[task(shared = [usb_host, driver, pin])]
     fn poll_usb_task(mut ctx: poll_usb_task::Context) {
-        (&mut ctx.shared.usb_host, &mut ctx.shared.driver).lock(|usb_host, driver| {
-            poll_usb_host(usb_host, driver, true)
+        (&mut ctx.shared.usb_host, &mut ctx.shared.driver, &mut ctx.shared.pin).lock(|usb_host, driver, pin| {
+            pin.set_high();
+            poll_usb_host(usb_host, driver, true);
+            pin.set_low();
         });
     }
 }
