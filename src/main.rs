@@ -5,25 +5,19 @@ use defmt as _;
 use defmt_rtt as _;
 use panic_probe as _;
 
-// mod descriptor_info;
-
 #[rtic::app(
     device = rp_pico::hal::pac, dispatchers = [TIMER_IRQ_1]
 )]
 mod app {
     use usbh::{
-        UsbHost,
-        PollResult,
+        driver::kbd::{KbdDriver, KbdEvent, KbdLed},
+        driver::log::{EventMask, LogDriver},
+        PollResult, UsbHost,
     };
 
     use embedded_hal::digital::v2::OutputPin;
 
-    use rp_pico::hal::{
-        self,
-        clocks,
-        watchdog::Watchdog,
-        usb::host::UsbHostBus,
-    };
+    use rp_pico::hal::{self, clocks, usb::host::UsbHostBus, watchdog::Watchdog};
     use rp_pico::XOSC_CRYSTAL_FREQ;
 
     use defmt::info;
@@ -35,19 +29,19 @@ mod app {
 
     // Shared resources go here
     #[shared]
-    struct Shared {
-    }
+    struct Shared {}
 
     // Local resources go here
     #[local]
     struct Local {
         usb_host: UsbHost<UsbHostBus>,
-        driver: usbh::driver::Kbd,
+        log_driver: LogDriver,
+        kbd_driver: KbdDriver,
         pin: hal::gpio::Pin<
             hal::gpio::bank0::Gpio2,
             hal::gpio::FunctionSioOutput,
             hal::gpio::PullDown,
-            >,
+        >,
     }
 
     #[init]
@@ -68,7 +62,7 @@ mod app {
             &mut watchdog,
         )
         .ok()
-            .unwrap();
+        .unwrap();
 
         let sio = hal::Sio::new(ctx.device.SIO);
 
@@ -91,8 +85,8 @@ mod app {
                 ctx.device.USBCTRL_REGS,
                 ctx.device.USBCTRL_DPRAM,
                 clocks.usb_clock,
-                &mut ctx.device.RESETS
-            )
+                &mut ctx.device.RESETS,
+            ),
         );
 
         (
@@ -102,7 +96,8 @@ mod app {
             Local {
                 // Initialization of local resources go here
                 usb_host,
-                driver: usbh::driver::Kbd::new(),
+                kbd_driver: KbdDriver::new(),
+                log_driver: LogDriver::new(EventMask::all()),
                 pin,
             },
             init::Monotonics(mono),
@@ -119,41 +114,69 @@ mod app {
         }
     }
 
-    #[task(binds = USBCTRL_IRQ, local = [usb_host, driver, pin])]
+    #[task(binds = USBCTRL_IRQ, local = [usb_host, kbd_driver, log_driver, pin, num_state: bool = false])]
     fn usbctrl_irq(ctx: usbctrl_irq::Context) {
         _ = ctx.local.pin.set_high();
 
-        match ctx.local.usb_host.poll(ctx.local.driver) {
+        match ctx
+            .local
+            .usb_host
+            .poll(&mut [ctx.local.log_driver, ctx.local.kbd_driver])
+        {
             PollResult::NoDevice => {
                 // No device is attached (yet)
                 return;
-            },
+            }
             PollResult::Busy => {
                 // Bus is currently busy communicating with the device
-            },
+            }
             PollResult::Idle => {
                 // Bus is idle, we can issue commands via the host interface
-            },
+            }
 
             PollResult::BusError(error) => {
                 defmt::error!("Bus error: {}", error);
             }
+
+            PollResult::DiscoveryError(dev_addr) => {
+                defmt::error!("Discovery for device {} failed", dev_addr);
+            }
+
+            _ => {}
         }
 
-        match ctx.local.driver.take_event() {
-            None => {},
+        match ctx.local.kbd_driver.take_event() {
+            None => {}
             Some(event) => {
-                use usbh::driver::KbdEvent;
                 match event {
                     KbdEvent::DeviceAdded(dev_addr) => {
                         info!("Keyboard with address {} added", dev_addr);
-                        ctx.local.driver.set_idle(dev_addr, 0, ctx.local.usb_host);
+                        ctx.local
+                            .kbd_driver
+                            .set_idle(dev_addr, 0, ctx.local.usb_host)
+                            .ok()
+                            .unwrap();
                     }
                     KbdEvent::DeviceRemoved(dev_addr) => {
                         info!("Keyboard with address {} removed", dev_addr);
                     }
                     KbdEvent::InputChanged(dev_addr, report) => {
                         info!("Input on keyboard {}:\n  {}", dev_addr, report);
+
+                        // toggle Num lock LED when NumLock key is pressed
+                        if report.pressed_keys().find(|key| *key == 83).is_some() {
+                            *ctx.local.num_state = !*ctx.local.num_state;
+                            ctx.local
+                                .kbd_driver
+                                .set_led(
+                                    dev_addr,
+                                    KbdLed::NumLock,
+                                    *ctx.local.num_state,
+                                    ctx.local.usb_host,
+                                )
+                                .ok()
+                                .unwrap();
+                        }
                     }
                     _ => {}
                 }
