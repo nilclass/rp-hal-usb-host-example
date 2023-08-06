@@ -1,3 +1,12 @@
+//! USB host support example, using the keyboard driver
+//!
+//! This example illustrates initializing the USB host stack, and using
+//! the keyboard driver.
+//!
+//! It will log a lot of things via defmt (including keypresses).
+//!
+//! It also interprets pressing the NumLock key, by toggling the NumLock LED.
+//!
 #![no_std]
 #![no_main]
 
