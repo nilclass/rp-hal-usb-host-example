@@ -165,7 +165,7 @@ mod app {
                         info!("Input on keyboard {}:\n  {}", dev_addr, report);
 
                         // toggle Num lock LED when NumLock key is pressed
-                        if report.pressed_keys().find(|key| *key == 83).is_some() {
+                        if report.pressed_keys().any(|key| key == 83) {
                             *ctx.local.num_state = !*ctx.local.num_state;
                             ctx.local
                                 .kbd_driver
