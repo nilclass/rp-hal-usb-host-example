@@ -31,11 +31,6 @@ mod app {
 
     use defmt::info;
 
-    use rp2040_monotonic::Rp2040Monotonic;
-
-    #[monotonic(binds = TIMER_IRQ_0, default = true)]
-    type Rp2040Mono = Rp2040Monotonic;
-
     // Shared resources go here
     #[shared]
     struct Shared {}
@@ -84,9 +79,6 @@ mod app {
 
         let pin = pins.gpio2.into_push_pull_output();
 
-        // Setup the monotonic timer
-        let mono = Rp2040Monotonic::new(ctx.device.TIMER);
-
         // Create UsbHost instance. Conceptually the `UsbHost` is not specific to any host implementation.
         let usb_host = UsbHost::new(
             // UsbHostBus here is the `usbh::bus::HostBus` implementation for the rp2040.
@@ -109,7 +101,7 @@ mod app {
                 log_driver: LogDriver::new(EventMask::all()),
                 pin,
             },
-            init::Monotonics(mono),
+            init::Monotonics(),
         )
     }
 
